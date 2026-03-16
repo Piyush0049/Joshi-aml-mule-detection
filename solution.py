@@ -1,0 +1,239 @@
+import polars as pl
+import pandas as pd
+import numpy as np
+import lightgbm as lgb
+from catboost import CatBoostClassifier
+from glob import glob
+from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
+import joblib
+
+BASE = "RBIH-NFPC-Phase-2"
+
+# =====================================================
+# LOAD DATA
+# =====================================================
+
+print("Loading datasets...")
+
+customers = pl.read_parquet(f"{BASE}/customers.parquet")
+accounts = pl.read_parquet(f"{BASE}/accounts.parquet")
+labels = pl.read_parquet(f"{BASE}/train_labels.parquet")
+test_accounts = pl.read_parquet(f"{BASE}/test_accounts.parquet")
+link = pl.read_parquet(f"{BASE}/customer_account_linkage.parquet")
+products = pl.read_parquet(f"{BASE}/product_details.parquet")
+
+# =====================================================
+# DATE FEATURES
+# =====================================================
+
+accounts = accounts.with_columns([
+    pl.col("account_opening_date").str.strptime(pl.Date, strict=False),
+    pl.col("last_kyc_date").str.strptime(pl.Date, strict=False)
+])
+
+accounts = accounts.with_columns([
+    (pl.date(2025,6,30) - pl.col("account_opening_date")).dt.total_days().alias("account_age_days")
+])
+
+# =====================================================
+# JOIN TABLES
+# =====================================================
+
+df = accounts.join(link, on="account_id", how="left")
+df = df.join(customers, on="customer_id", how="left")
+df = df.join(products, on="customer_id", how="left")
+
+# =====================================================
+# TRANSACTION FEATURES
+# =====================================================
+
+print("Processing transactions...")
+
+txn_files = sorted(glob(f"{BASE}/transactions/batch-*/part_*.parquet"))
+
+txn_feats = []
+
+for f in tqdm(txn_files):
+
+    tx = pl.read_parquet(f)
+
+    agg = tx.group_by("account_id").agg([
+
+        pl.len().alias("txn_count"),
+        pl.col("amount").sum().alias("txn_sum"),
+        pl.col("amount").mean().alias("txn_mean"),
+        pl.col("amount").std().alias("txn_std"),
+        pl.col("amount").max().alias("txn_max"),
+
+        pl.col("txn_type").filter(pl.col("txn_type")=="C").count().alias("credit_count"),
+        pl.col("txn_type").filter(pl.col("txn_type")=="D").count().alias("debit_count"),
+
+        pl.col("amount").filter(pl.col("txn_type")=="C").sum().alias("credit_sum"),
+        pl.col("amount").filter(pl.col("txn_type")=="D").sum().alias("debit_sum"),
+
+        pl.col("amount").filter((pl.col("amount")>48000) & (pl.col("amount")<50000)).count().alias("near_50k_txn"),
+
+        (pl.col("amount") % 1000 == 0).sum().alias("round_txn"),
+
+        pl.col("channel").n_unique().alias("channel_unique"),
+        pl.col("counterparty_id").n_unique().alias("unique_counterparties")
+
+    ])
+
+    txn_feats.append(agg)
+
+txn_feats = pl.concat(txn_feats)
+txn_feats = txn_feats.group_by("account_id").agg(pl.all().sum())
+
+# =====================================================
+# MERGE FEATURES
+# =====================================================
+
+df = df.join(txn_feats, on="account_id", how="left")
+df = df.fill_null(0)
+
+df = df.with_columns([
+    (pl.col("credit_sum") / (pl.col("debit_sum")+1)).alias("credit_debit_ratio"),
+    (pl.col("debit_count") / (pl.col("txn_count")+1)).alias("debit_ratio")
+])
+
+# =====================================================
+# TRAIN TEST SPLIT
+# =====================================================
+
+train = df.join(labels.select(["account_id","is_mule"]), on="account_id")
+test = df.join(test_accounts, on="account_id", how="inner")
+
+train_pd = train.to_pandas()
+test_pd = test.to_pandas()
+
+y = train_pd["is_mule"]
+
+X = train_pd.drop(["is_mule","account_id","customer_id"], axis=1, errors="ignore")
+X_test = test_pd.drop(["account_id","customer_id"], axis=1, errors="ignore")
+
+# =====================================================
+# FIX DATE COLUMNS
+# =====================================================
+
+for col in X.columns:
+
+    if "date" in col or "birth" in col:
+
+        X[col] = pd.to_datetime(X[col], errors="coerce")
+        X_test[col] = pd.to_datetime(X_test[col], errors="coerce")
+
+        X[col] = (pd.Timestamp("2025-06-30") - X[col]).dt.days
+        X_test[col] = (pd.Timestamp("2025-06-30") - X_test[col]).dt.days
+
+# =====================================================
+# CONVERT Y/N TO 1/0
+# =====================================================
+
+yn_cols = X.columns[X.isin(["Y","N"]).any()]
+
+for col in yn_cols:
+
+    X[col] = X[col].map({"Y":1,"N":0})
+    X_test[col] = X_test[col].map({"Y":1,"N":0})
+
+# =====================================================
+# ENCODE OTHER CATEGORICALS
+# =====================================================
+
+for col in X.columns:
+
+    if X[col].dtype == "object":
+
+        X[col] = X[col].astype("category").cat.codes
+        X_test[col] = X_test[col].astype("category").cat.codes
+
+# =====================================================
+# FINAL CLEAN
+# =====================================================
+
+X = X.fillna(0)
+X_test = X_test.fillna(0)
+
+# =====================================================
+# TRAIN SPLIT
+# =====================================================
+
+X_train, X_val, y_train, y_val = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
+
+# =====================================================
+# LIGHTGBM
+# =====================================================
+
+print("Training LightGBM...")
+
+lgb_model = lgb.LGBMClassifier(
+    n_estimators=800,
+    learning_rate=0.03,
+    num_leaves=128,
+    max_depth=12,
+    subsample=0.8,
+    colsample_bytree=0.8
+)
+
+lgb_model.fit(X_train, y_train)
+
+pred_lgb = lgb_model.predict_proba(X_val)[:,1]
+
+print("LightGBM AUC:", roc_auc_score(y_val, pred_lgb))
+
+joblib.dump(lgb_model, "lightgbm_model.pkl")
+
+# =====================================================
+# CATBOOST
+# =====================================================
+
+print("Training CatBoost...")
+
+cat_model = CatBoostClassifier(
+    iterations=800,
+    depth=10,
+    learning_rate=0.03,
+    loss_function="Logloss",
+    verbose=False
+)
+
+cat_model.fit(X_train, y_train)
+
+pred_cat = cat_model.predict_proba(X_val)[:,1]
+
+print("CatBoost AUC:", roc_auc_score(y_val, pred_cat))
+
+joblib.dump(cat_model, "catboost_model.pkl")
+
+# =====================================================
+# ENSEMBLE
+# =====================================================
+
+pred_val = 0.5*pred_lgb + 0.5*pred_cat
+
+print("Ensemble AUC:", roc_auc_score(y_val, pred_val))
+
+# =====================================================
+# TEST PREDICTIONS
+# =====================================================
+
+pred_lgb_test = lgb_model.predict_proba(X_test)[:,1]
+pred_cat_test = cat_model.predict_proba(X_test)[:,1]
+
+preds = 0.5*pred_lgb_test + 0.5*pred_cat_test
+
+submission = pd.DataFrame({
+    "account_id": test_pd["account_id"],
+    "is_mule": preds,
+    "suspicious_start": "",
+    "suspicious_end": ""
+})
+
+submission.to_csv("submission.csv", index=False)
+
+print("Submission saved as submission.csv")

@@ -211,6 +211,10 @@ This metric is particularly suitable for fraud detection problems where the data
 
 # Running the Project
 
+## Environment Setup
+
+**Python Version:** Python 3.10 or higher recommended
+
 ## Install Dependencies
 
 ```
@@ -227,6 +231,7 @@ Required libraries:
 - pyarrow
 - scikit-learn
 - tqdm
+- joblib
 
 ---
 
